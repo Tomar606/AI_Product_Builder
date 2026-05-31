@@ -1,0 +1,15 @@
+# Virtual environment — machine-specific, huge, shouldn't be shared
+venv/
+
+# Python compiled cache
+__pycache__/
+*.pyc
+
+# Local data — user contacts shouldn't be in version control
+contacts.json
+contacts.json.bak
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
