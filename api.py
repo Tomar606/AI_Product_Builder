@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 import httpx
 from pydantic import BaseModel
+import json
 
 app = FastAPI()
 
@@ -31,7 +32,20 @@ def get_github_user(username: str):
         public_repos=data["public_repos"],
     )
 
-contacts_db: list[dict] = []
+CONTACTS_FILE = "contacts_api.json"
+
+def save_contacts_db():
+    with open(CONTACTS_FILE, "w") as f:
+        json.dump(contacts_db, f, indent=2)
+
+def load_contacts_db() -> list[dict]:
+    try:
+        with open(CONTACTS_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+contacts_db: list[dict] = load_contacts_db()
 
 class ContactCreate(BaseModel):
     name: str
@@ -44,13 +58,20 @@ class Contact(BaseModel):
     email: str
 
 @app.get("/contacts", response_model=list[Contact])
-def list_contacts():
-    return contacts_db
+def list_contacts(age_min: int | None = None, age_max: int | None = None):
+    results = contacts_db
+    if age_min is not None:
+        results = [c for c in results if c["age"] >= age_min]
+    if age_max is not None:
+        results = [c for c in results if c["age"] <= age_max]
+    return results
+
 
 
 @app.post("/contacts", response_model=Contact, status_code=201)
 def create_contact(contact: ContactCreate):
     contacts_db.append(contact.model_dump())
+    save_contacts_db()
     return contact
 
 @app.get("/contacts/{name}", response_model=Contact)
@@ -65,5 +86,17 @@ def get_contact(name: str):
 def delete_contact(name: str):
     for i, contact in enumerate(contacts_db):
         if contact["name"] == name:
-            return contacts_db.pop(i)
+            deleted = contacts_db.pop(i)
+            save_contacts_db()
+            return deleted
+    raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+
+
+@app.put("/contacts/{name}", response_model=Contact)
+def update_contact(name: str, contact: ContactCreate):
+    for i, c in enumerate(contacts_db):
+        if c["name"] == name:
+            contacts_db[i] = contact.model_dump()
+            save_contacts_db()
+            return contacts_db[i]
     raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")

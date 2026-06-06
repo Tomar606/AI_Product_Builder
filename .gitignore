@@ -8,6 +8,9 @@ __pycache__/
 # Local data — user contacts shouldn't be in version control
 contacts.json
 contacts.json.bak
+hn_cache.json
+contacts_api.json
+
 
 # OS / editor noise
 .DS_Store
