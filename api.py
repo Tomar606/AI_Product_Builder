@@ -1,51 +1,38 @@
 from fastapi import FastAPI, HTTPException
-import httpx
-from pydantic import BaseModel
-import json
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
+from fastapi import Depends
+
+DATABASE_URL = "postgresql+psycopg://localhost/ai_product_builder"
+
+engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+class ContactDB(Base):
+    __tablename__ = "contacts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(unique=True, index=True)
+    age: Mapped[int]
+    email: Mapped[str]
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 
 app = FastAPI()
-
-@app.get("/")
-def hello():
-    return {"message": "Hello, World!"}
-
-class GithubUserResponse(BaseModel):
-    username: str
-    name: str | None
-    bio: str | None
-    followers: int
-    public_repos: int
-
-@app.get("/github/{username}", response_model=GithubUserResponse)
-def get_github_user(username: str):
-    response = httpx.get(f"https://api.github.com/users/{username}")
-    if response.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"GitHub user '{username}' not found")
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail="GitHub API error")
-    data = response.json()
-    return GithubUserResponse(
-        username=data["login"],
-        name=data.get("name"),
-        bio=data.get("bio"),
-        followers=data["followers"],
-        public_repos=data["public_repos"],
-    )
-
-CONTACTS_FILE = "contacts_api.json"
-
-def save_contacts_db():
-    with open(CONTACTS_FILE, "w") as f:
-        json.dump(contacts_db, f, indent=2)
-
-def load_contacts_db() -> list[dict]:
-    try:
-        with open(CONTACTS_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
-
-contacts_db: list[dict] = load_contacts_db()
 
 class ContactCreate(BaseModel):
     name: str
@@ -53,50 +40,72 @@ class ContactCreate(BaseModel):
     email: str
 
 class Contact(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
     name: str
     age: int
     email: str
 
 @app.get("/contacts", response_model=list[Contact])
-def list_contacts(age_min: int | None = None, age_max: int | None = None):
-    results = contacts_db
+def list_contacts(
+    age_min: int | None = None,
+    age_max: int | None = None,
+    db: Session = Depends(get_db),
+):
+    stmt = select(ContactDB)
     if age_min is not None:
-        results = [c for c in results if c["age"] >= age_min]
+        stmt = stmt.where(ContactDB.age >= age_min)
     if age_max is not None:
-        results = [c for c in results if c["age"] <= age_max]
-    return results
+        stmt = stmt.where(ContactDB.age <= age_max)
+    return db.scalars(stmt).all()
 
 
 
 @app.post("/contacts", response_model=Contact, status_code=201)
-def create_contact(contact: ContactCreate):
-    contacts_db.append(contact.model_dump())
-    save_contacts_db()
-    return contact
+def create_contact(contact: ContactCreate, db: Session = Depends(get_db)):
+    db_contact = ContactDB(**contact.model_dump())
+    db.add(db_contact)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Contact with name '{contact.name}' already exists"
+        )
+    db.refresh(db_contact)         # reload so id (DB-generated) is populated
+    return db_contact
 
 @app.get("/contacts/{name}", response_model=Contact)
-def get_contact(name: str):
-    for contact in contacts_db:
-        if contact["name"] == name:
-            return contact
-    raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
-
-
-@app.delete("/contacts/{name}", response_model=Contact)
-def delete_contact(name: str):
-    for i, contact in enumerate(contacts_db):
-        if contact["name"] == name:
-            deleted = contacts_db.pop(i)
-            save_contacts_db()
-            return deleted
-    raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+def get_contact(name: str, db: Session = Depends(get_db)):
+    stmt = select(ContactDB).where(ContactDB.name == name)
+    contact = db.scalars(stmt).first()
+    if contact is None:
+        raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+    return contact
 
 
 @app.put("/contacts/{name}", response_model=Contact)
-def update_contact(name: str, contact: ContactCreate):
-    for i, c in enumerate(contacts_db):
-        if c["name"] == name:
-            contacts_db[i] = contact.model_dump()
-            save_contacts_db()
-            return contacts_db[i]
-    raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+def update_contact(name: str, contact: ContactCreate, db: Session = Depends(get_db)):
+    stmt = select(ContactDB).where(ContactDB.name == name)
+    db_contact = db.scalars(stmt).first()
+    if db_contact is None:
+        raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+    db_contact.name = contact.name
+    db_contact.age = contact.age
+    db_contact.email = contact.email
+    db.commit()
+    db.refresh(db_contact)
+    return db_contact
+
+
+
+@app.delete("/contacts/{name}", response_model=Contact)
+def delete_contact(name: str, db: Session = Depends(get_db)):
+    stmt = select(ContactDB).where(ContactDB.name == name)
+    db_contact = db.scalars(stmt).first()
+    if db_contact is None:
+        raise HTTPException(status_code=404, detail=f"Contact '{name}' not found")
+    db.delete(db_contact)
+    db.commit()
+    return db_contact
