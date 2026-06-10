@@ -1,3 +1,5 @@
+import os
+from fastapi.security import APIKeyHeader
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import create_engine, select
@@ -5,11 +7,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
 from fastapi import Depends
 
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
 DATABASE_URL = "postgresql+psycopg://localhost/ai_product_builder"
 
 engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+def verify_api_key(provided_key: str | None = Depends(api_key_header)):
+    expected = os.environ.get("API_KEY")
+    if not expected:
+        raise HTTPException(status_code=500, detail="server misconfigured: API_KEY not set")
+    if provided_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 class Base(DeclarativeBase):
     pass
@@ -46,7 +57,7 @@ class Contact(BaseModel):
     age: int
     email: str
 
-@app.get("/contacts", response_model=list[Contact])
+@app.get("/contacts", response_model=list[Contact], dependencies=[Depends(verify_api_key)])
 def list_contacts(
     age_min: int | None = None,
     age_max: int | None = None,
@@ -61,7 +72,7 @@ def list_contacts(
 
 
 
-@app.post("/contacts", response_model=Contact, status_code=201)
+@app.post("/contacts", response_model=Contact, status_code=201, dependencies=[Depends(verify_api_key)])
 def create_contact(contact: ContactCreate, db: Session = Depends(get_db)):
     db_contact = ContactDB(**contact.model_dump())
     db.add(db_contact)
@@ -76,7 +87,7 @@ def create_contact(contact: ContactCreate, db: Session = Depends(get_db)):
     db.refresh(db_contact)         # reload so id (DB-generated) is populated
     return db_contact
 
-@app.get("/contacts/{name}", response_model=Contact)
+@app.get("/contacts/{name}", response_model=Contact, dependencies=[Depends(verify_api_key)])
 def get_contact(name: str, db: Session = Depends(get_db)):
     stmt = select(ContactDB).where(ContactDB.name == name)
     contact = db.scalars(stmt).first()
@@ -85,7 +96,7 @@ def get_contact(name: str, db: Session = Depends(get_db)):
     return contact
 
 
-@app.put("/contacts/{name}", response_model=Contact)
+@app.put("/contacts/{name}", response_model=Contact, dependencies=[Depends(verify_api_key)])
 def update_contact(name: str, contact: ContactCreate, db: Session = Depends(get_db)):
     stmt = select(ContactDB).where(ContactDB.name == name)
     db_contact = db.scalars(stmt).first()
@@ -100,7 +111,7 @@ def update_contact(name: str, contact: ContactCreate, db: Session = Depends(get_
 
 
 
-@app.delete("/contacts/{name}", response_model=Contact)
+@app.delete("/contacts/{name}", response_model=Contact, dependencies=[Depends(verify_api_key)])
 def delete_contact(name: str, db: Session = Depends(get_db)):
     stmt = select(ContactDB).where(ContactDB.name == name)
     db_contact = db.scalars(stmt).first()
