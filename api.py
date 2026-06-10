@@ -9,7 +9,11 @@ from fastapi import Depends
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-DATABASE_URL = "postgresql+psycopg://localhost/ai_product_builder"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg://localhost/ai_product_builder")
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+elif 
 
 engine = create_engine(DATABASE_URL)
 
