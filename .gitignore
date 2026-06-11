@@ -10,7 +10,7 @@ contacts.json
 contacts.json.bak
 hn_cache.json
 contacts_api.json
-
+.env
 
 # OS / editor noise
 .DS_Store

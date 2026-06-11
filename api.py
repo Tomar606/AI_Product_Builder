@@ -6,7 +6,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column, Session
 from fastapi import Depends
+from openai import OpenAI
+from dotenv import load_dotenv
 
+load_dotenv()
+openai_client = OpenAI()
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg://localhost/ai_product_builder")
@@ -26,6 +30,15 @@ def verify_api_key(provided_key: str | None = Depends(api_key_header)):
         raise HTTPException(status_code=500, detail="server misconfigured: API_KEY not set")
     if provided_key != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    
+class ContactCreate(BaseModel):
+    text: str
+
+class SummarizeResponse(BaseModel):
+    summary: str
+
+class SummarizeRequest(BaseModel):
+    text: str
 
 class Base(DeclarativeBase):
     pass
@@ -125,3 +138,22 @@ def delete_contact(name: str, db: Session = Depends(get_db)):
     db.delete(db_contact)
     db.commit()
     return db_contact
+
+
+@app.post("/summarize", response_model=SummarizeResponse, dependencies=[Depends(verify_api_key)])
+def summarize_text(req: SummarizeRequest):
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that summarizer. Given any text, return a single-sentence summary that capture the key idea. No fluff"
+            },
+            {
+                "role": "user",
+                "content": req.text
+            }
+        ]
+    )
+    summary = response.choices[0].message.content
+    return SummarizeResponse(summary=summary)
