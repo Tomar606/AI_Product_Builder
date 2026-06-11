@@ -8,6 +8,9 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase, Mapped, mapped_column,
 from fastapi import Depends
 from openai import OpenAI
 from dotenv import load_dotenv
+from typing import Literal
+import numpy as np
+
 
 load_dotenv()
 openai_client = OpenAI()
@@ -43,12 +46,32 @@ class SummarizeRequest(BaseModel):
 class Base(DeclarativeBase):
     pass
 
+documents_store: list[dict] = []
+next_doc_id = 1
+
 class ContactDB(Base):
     __tablename__ = "contacts"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(unique=True, index=True)
     age: Mapped[int]
     email: Mapped[str]
+
+class SummarizeStructured(BaseModel):
+    summary: str
+    key_topics: list[str]
+    sentiment: Literal["positive", "neutral", "negative"]
+    estimated_reading_time_minutes: int
+    
+class DocumentCreate(BaseModel):
+    text: str
+
+class Document(BaseModel):
+    id: int
+    text: str
+
+class SearchResult(BaseModel):
+    document: Document
+    similarity: float  
 
 Base.metadata.create_all(bind=engine)
 
@@ -59,7 +82,16 @@ def get_db():
     finally:
         db.close()
 
+def get_embedding(text: str) -> list[float]:
+    response = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return response.data[0].embedding
 
+def cosine_sim(a: list[float], b: list[float]) -> float:
+    a_arr, b_arr = np.array(a), np.array(b)
+    return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
 
 app = FastAPI()
 
@@ -140,9 +172,9 @@ def delete_contact(name: str, db: Session = Depends(get_db)):
     return db_contact
 
 
-@app.post("/summarize", response_model=SummarizeResponse, dependencies=[Depends(verify_api_key)])
+@app.post("/summarize", response_model=SummarizeStructured, dependencies=[Depends(verify_api_key)])
 def summarize_text(req: SummarizeRequest):
-    response = openai_client.chat.completions.create(
+    response = openai_client.beta.chat.completions.parse(
         model="gpt-4o-mini",
         messages=[
             {
@@ -153,7 +185,36 @@ def summarize_text(req: SummarizeRequest):
                 "role": "user",
                 "content": req.text
             }
-        ]
+        ],
+        response_format=SummarizeStructured,
     )
-    summary = response.choices[0].message.content
-    return SummarizeResponse(summary=summary)
+    return response.choices[0].message.parsed
+
+@app.post("/documents", response_model=Document, status_code=201, dependencies=[Depends(verify_api_key)])
+def create_document(doc: DocumentCreate):
+    global next_doc_id
+    embedding = get_embedding(doc.text)
+    record = {"id": next_doc_id, "text": doc.text, "embedding": embedding}
+    documents_store.append(record)
+    next_doc_id += 1
+    return Document(id=record["id"], text=record["text"])
+
+@app.get("/documents", response_model=list[Document], dependencies=[Depends(verify_api_key)])
+def list_documents():
+    return [Document(id=d["id"], text=d["text"]) for d in documents_store]
+
+
+@app.get("/search", response_model=list[SearchResult], dependencies=[Depends(verify_api_key)])
+def search(q: str, k: int = 3):
+    if not documents_store:
+        return []
+    q_emb = get_embedding(q)
+    scored = [
+        SearchResult(
+            document=Document(id=d["id"], text=d["text"]),
+            similarity=cosine_sim(q_emb, d["embedding"]),
+        )
+        for d in documents_store
+    ]
+    scored.sort(key=lambda r: r.similarity, reverse=True)
+    return scored[:k]
