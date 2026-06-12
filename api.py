@@ -73,6 +73,15 @@ class SearchResult(BaseModel):
     document: Document
     similarity: float  
 
+class AskRequest(BaseModel):
+    question: str
+    k: int = 3   # how many docs to retrieve (optional default)
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[int]   # IDs of the docs the LLM cited
+
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -218,3 +227,44 @@ def search(q: str, k: int = 3):
     ]
     scored.sort(key=lambda r: r.similarity, reverse=True)
     return scored[:k]
+
+
+@app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
+def ask(req: AskRequest):
+    if not documents_store:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents stored yet. POST some to /documents first.",
+        )
+
+    # 1. RETRIEVE: embed the question, score all docs by cosine similarity, take top k
+    q_emb = get_embedding(req.question)
+    scored = [(d, cosine_sim(q_emb, d["embedding"])) for d in documents_store]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    top_docs = [d for d, _ in scored[:req.k]]
+
+    # 2. AUGMENT: build a context block where each doc is labeled with its ID
+    context = "\n\n".join(f"[{d['id']}] {d['text']}" for d in top_docs)
+
+    # 3. GENERATE: call the LLM with the context as a system prompt, structured response
+    response = openai_client.beta.chat.completions.parse(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You answer questions using ONLY the provided context. "
+                    "If the answer isn't in the context, say 'I don't have enough information to answer that.' — do NOT make anything up. "
+                    "Each context item starts with its ID in brackets like [3]. "
+                    "When you return sources, list the IDs of the context items you actually used."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {req.question}",
+            },
+        ],
+        response_format=AskResponse,
+    )
+
+    return response.choices[0].message.parsed
