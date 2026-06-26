@@ -11,10 +11,71 @@ from dotenv import load_dotenv
 from typing import Literal
 import numpy as np
 from pgvector.sqlalchemy import Vector
+from sqlalchemy import ForeignKey
+from fastapi.responses import StreamingResponse
+import json
+from typing import Any
+
 
 load_dotenv()
 openai_client = OpenAI()
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+CONTACT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_contacts",
+            "description": "List all contacts in the database. Returns a list of contacts with id, name, age, email.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_contact",
+            "description": "Add a new contact to the database. Use when the user wants to create or save a new contact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The contact's full name"},
+                    "age": {"type": "integer", "description": "The contact's age in years"},
+                    "email": {"type": "string", "description": "The contact's email address"},
+                },
+                "required": ["name", "age", "email"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_contact",
+            "description": "Find a single contact by their exact name. Returns the contact's details or an error if not found.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The name to search for (exact match)"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_contact",
+            "description": "Delete a contact by name. Use ONLY when the user explicitly asks to delete or remove a contact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The exact name of the contact to delete"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+]
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg://localhost/ai_product_builder")
 
@@ -59,6 +120,14 @@ class DocumentDB(Base):
     text: Mapped[str]
     embedding = mapped_column(Vector(1536))
 
+class ChunkDB(Base):
+    __tablename__ = "chunks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"))
+    chunk_index: Mapped[int]
+    text: Mapped[str]
+    embedding = mapped_column(Vector(1536))
+
 class SummarizeStructured(BaseModel):
     summary: str
     key_topics: list[str]
@@ -72,9 +141,11 @@ class Document(BaseModel):
     id: int
     text: str
 
-class SearchResult(BaseModel):
-    document: Document
-    similarity: float  
+class ChunkResult(BaseModel):
+    chunk_id: int
+    document_id: int
+    text: str
+    similarity: float 
 
 class AskRequest(BaseModel):
     question: str
@@ -83,6 +154,19 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: list[int]   # IDs of the docs the LLM cited
+
+class AgentRequest(BaseModel):
+    query: str
+    max_steps: int = 10   # safety cap to avoid runaway loops
+
+class AgentStep(BaseModel):
+    tool: str
+    args: dict
+    result: Any
+
+class AgentResponse(BaseModel):
+    answer: str
+    steps: list[AgentStep]
 
 
 Base.metadata.create_all(bind=engine)
@@ -104,6 +188,51 @@ def get_embedding(text: str) -> list[float]:
 def cosine_sim(a: list[float], b: list[float]) -> float:
     a_arr, b_arr = np.array(a), np.array(b)
     return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
+
+def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    step = size - overlap
+    for start in range(0, len(text), step):
+        chunks.append(text[start:start + size])
+        if start + size >= len(text):
+            break
+    return chunks
+
+def execute_tool(name: str, args: dict, db: Session) -> dict:
+    """Execute a tool by name with given args. Returns a dict to send back to the LLM."""
+    if name == "list_contacts":
+        contacts = db.scalars(select(ContactDB)).all()
+        return {"contacts": [{"id": c.id, "name": c.name, "age": c.age, "email": c.email} for c in contacts]}
+
+    elif name == "add_contact":
+        db_c = ContactDB(**args)
+        db.add(db_c)
+        try:
+            db.commit()
+            db.refresh(db_c)
+            return {"id": db_c.id, "name": db_c.name, "age": db_c.age, "email": db_c.email}
+        except IntegrityError:
+            db.rollback()
+            return {"error": f"Contact named '{args['name']}' already exists"}
+
+    elif name == "find_contact":
+        c = db.scalars(select(ContactDB).where(ContactDB.name == args["name"])).first()
+        if c is None:
+            return {"error": f"No contact named '{args['name']}'"}
+        return {"id": c.id, "name": c.name, "age": c.age, "email": c.email}
+
+    elif name == "delete_contact":
+        c = db.scalars(select(ContactDB).where(ContactDB.name == args["name"])).first()
+        if c is None:
+            return {"error": f"No contact named '{args['name']}'"}
+        db.delete(c)
+        db.commit()
+        return {"deleted": True, "name": args["name"]}
+
+    return {"error": f"Unknown tool: {name}"}
+
 
 app = FastAPI()
 
@@ -204,34 +333,55 @@ def summarize_text(req: SummarizeRequest):
 
 @app.post("/documents", response_model=Document, status_code=201, dependencies=[Depends(verify_api_key)])
 def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
-    embedding = get_embedding(doc.text)
-    db_doc = DocumentDB(text=doc.text, embedding=embedding)
+    # 1. Create the parent document row
+    db_doc = DocumentDB(text=doc.text)
     db.add(db_doc)
+    db.flush()                          # assigns db_doc.id without committing yet
+
+    # 2. Chunk the text
+    chunks = chunk_text(doc.text)
+
+    # 3. Embed all chunks in ONE batched API call (cheaper + faster)
+    response = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=chunks,
+    )
+    chunk_embeddings = [item.embedding for item in response.data]
+
+    # 4. Insert chunk rows
+    for i, (chunk_text_str, emb) in enumerate(zip(chunks, chunk_embeddings)):
+        db.add(ChunkDB(
+            document_id=db_doc.id,
+            chunk_index=i,
+            text=chunk_text_str,
+            embedding=emb,
+        ))
     db.commit()
     db.refresh(db_doc)
     return Document(id=db_doc.id, text=db_doc.text)
 
 @app.get("/documents", response_model=list[Document], dependencies=[Depends(verify_api_key)])
 def list_documents(db: Session = Depends(get_db)):
-    stmt = select(DocumentDB)
-    return [Document(id=d.id, text=d.text) for d in db.scalars(stmt).all()]
+    return [Document(id=d.id, text=d.text) for d in db.scalars(select(DocumentDB)).all()]
 
 
-@app.get("/search", response_model=list[SearchResult], dependencies=[Depends(verify_api_key)])
+@app.get("/search", response_model=list[ChunkResult], dependencies=[Depends(verify_api_key)])
 def search(q: str, k: int = 3, db: Session = Depends(get_db)):
     q_emb = get_embedding(q)
     stmt = (
         select(
-            DocumentDB,
-            DocumentDB.embedding.cosine_distance(q_emb).label("distance"),
+            ChunkDB,
+            ChunkDB.embedding.cosine_distance(q_emb).label("distance"),
         )
-        .order_by(DocumentDB.embedding.cosine_distance(q_emb))
+        .order_by(ChunkDB.embedding.cosine_distance(q_emb))
         .limit(k)
     )
     rows = db.execute(stmt).all()
     return [
-        SearchResult(
-            document=Document(id=row.DocumentDB.id, text=row.DocumentDB.text),
+        ChunkResult(
+            chunk_id=row.ChunkDB.id,
+            document_id=row.ChunkDB.document_id,
+            text=row.ChunkDB.text,
             similarity=1.0 - row.distance,
         )
         for row in rows
@@ -240,19 +390,20 @@ def search(q: str, k: int = 3, db: Session = Depends(get_db)):
 
 @app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
 def ask(req: AskRequest, db: Session = Depends(get_db)):
-    first = db.scalars(select(DocumentDB).limit(1)).first()
+    first = db.scalars(select(ChunkDB).limit(1)).first()
     if first is None:
         raise HTTPException(status_code=400, detail="No documents stored yet. POST some to /documents first.")
 
     q_emb = get_embedding(req.question)
     stmt = (
-        select(DocumentDB)
-        .order_by(DocumentDB.embedding.cosine_distance(q_emb))
+        select(ChunkDB)
+        .order_by(ChunkDB.embedding.cosine_distance(q_emb))
         .limit(req.k)
     )
-    top_docs = db.scalars(stmt).all()
+    top_chunks = db.scalars(stmt).all()
 
-    context = "\n\n".join(f"[{d.id}] {d.text}" for d in top_docs)
+    # Context labels each chunk with its ID
+    context = "\n\n".join(f"[{c.id}] {c.text}" for c in top_chunks)
 
     response = openai_client.beta.chat.completions.parse(
         model="gpt-4o-mini",
@@ -274,3 +425,128 @@ def ask(req: AskRequest, db: Session = Depends(get_db)):
         response_format=AskResponse,
     )
     return response.choices[0].message.parsed
+
+
+@app.post("/ask/stream", dependencies=[Depends(verify_api_key)])
+def ask_stream(req: AskRequest, db: Session = Depends(get_db)):
+    first = db.scalars(select(ChunkDB).limit(1)).first()
+    if first is None:
+        raise HTTPException(status_code=400, detail="No documents stored yet.")
+
+    q_emb = get_embedding(req.question)
+    stmt = (
+        select(ChunkDB)
+        .order_by(ChunkDB.embedding.cosine_distance(q_emb))
+        .limit(req.k)
+    )
+    top_chunks = db.scalars(stmt).all()
+    context = "\n\n".join(f"[{c.id}] {c.text}" for c in top_chunks)
+
+    # ↓ FROM HERE, 4 SPACES (one level inside ask_stream)
+    def token_stream():
+        stream = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You answer questions using ONLY the provided context. If the answer isn't in the context, say 'I don't have enough information to answer that.' Use the context to construct a complete, helpful answer when the information is present."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {req.question}"},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
+    return StreamingResponse(token_stream(), media_type="text/plain")
+
+@app.post("/ask/stream", dependencies=[Depends(verify_api_key)])
+def ask_stream(req: AskRequest, db: Session = Depends(get_db)):
+    first = db.scalars(select(ChunkDB).limit(1)).first()
+    if first is None:
+        raise HTTPException(status_code=400, detail="No documents stored yet.")
+
+    q_emb = get_embedding(req.question)
+    stmt = (
+        select(ChunkDB)
+        .order_by(ChunkDB.embedding.cosine_distance(q_emb))
+        .limit(req.k)
+    )
+    top_chunks = db.scalars(stmt).all()
+    context = "\n\n".join(f"[{c.id}] {c.text}" for c in top_chunks)
+
+    # ↓ FROM HERE, 4 SPACES (one level inside ask_stream)
+    def token_stream():
+        stream = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You answer questions using ONLY the provided context. If the answer isn't in the context, say 'I don't have enough information to answer that.' Use the context to construct a complete, helpful answer when the information is present."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {req.question}"},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
+    return StreamingResponse(token_stream(), media_type="text/plain")
+
+
+@app.post("/agent", response_model=AgentResponse, dependencies=[Depends(verify_api_key)])
+def run_agent(req: AgentRequest, db: Session = Depends(get_db)):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful contacts assistant. You can list, add, find, and delete contacts "
+                "by calling the provided tools. Use tools when needed; after you have what you need, "
+                "give the user a concise natural-language summary of what you did."
+            ),
+        },
+        {"role": "user", "content": req.query},
+    ]
+    steps: list[AgentStep] = []
+
+    for _ in range(req.max_steps):
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=CONTACT_TOOLS,
+            tool_choice="auto",
+        )
+        msg = response.choices[0].message
+
+        # No tool calls → final answer
+        if not msg.tool_calls:
+            return AgentResponse(answer=msg.content or "", steps=steps)
+
+        # Append the assistant's message (with the tool_calls intact) to history
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ],
+        })
+
+        # Execute each tool call, append result
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            result = execute_tool(tc.function.name, args, db)
+            steps.append(AgentStep(tool=tc.function.name, args=args, result=result))
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result),
+            })
+        # loop continues — LLM sees the tool results and decides next move
+
+    # Hit max_steps without a final answer
+    return AgentResponse(answer="(agent stopped after max_steps without finishing)", steps=steps)
