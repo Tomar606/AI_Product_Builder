@@ -15,6 +15,94 @@ from sqlalchemy import ForeignKey
 from fastapi.responses import StreamingResponse
 import json
 from typing import Any
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+# Module-level DB session helper for the tools
+# (tools don't easily share FastAPI's Depends, so we'll open sessions ourselves)
+def _new_session():
+    return SessionLocal()
+
+@tool
+def list_contacts_tool() -> dict:
+    """List all contacts in the database. Returns a list of contacts with id, name, age, email."""
+    db = _new_session()
+    try:
+        contacts = db.scalars(select(ContactDB)).all()
+        return {"contacts": [{"id": c.id, "name": c.name, "age": c.age, "email": c.email} for c in contacts]}
+    finally:
+        db.close()
+
+@tool
+def add_contact_tool(name: str, age: int, email: str) -> dict:
+    """Add a new contact to the database. Use when the user wants to create or save a new contact."""
+    db = _new_session()
+    try:
+        db_c = ContactDB(name=name, age=age, email=email)
+        db.add(db_c)
+        try:
+            db.commit()
+            db.refresh(db_c)
+            return {"id": db_c.id, "name": db_c.name, "age": db_c.age, "email": db_c.email}
+        except IntegrityError:
+            db.rollback()
+            return {"error": f"Contact named '{name}' already exists"}
+    finally:
+        db.close()
+
+@tool
+def find_contact_tool(name: str) -> dict:
+    """Find a single contact by their exact name. Returns the contact's details or an error if not found."""
+    db = _new_session()
+    try:
+        c = db.scalars(select(ContactDB).where(ContactDB.name == name)).first()
+        if c is None:
+            return {"error": f"No contact named '{name}'"}
+        return {"id": c.id, "name": c.name, "age": c.age, "email": c.email}
+    finally:
+        db.close()
+
+@tool
+def delete_contact_tool(name: str) -> dict:
+    """Delete a contact by name. Use ONLY when the user explicitly asks to delete or remove a contact."""
+    db = _new_session()
+    try:
+        c = db.scalars(select(ContactDB).where(ContactDB.name == name)).first()
+        if c is None:
+            return {"error": f"No contact named '{name}'"}
+        db.delete(c)
+        db.commit()
+        return {"deleted": True, "name": name}
+    finally:
+        db.close()
+
+LANGGRAPH_TOOLS = [list_contacts_tool, add_contact_tool, find_contact_tool, delete_contact_tool]
+
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm_with_tools = llm.bind_tools(LANGGRAPH_TOOLS)
+
+def agent_node(state: MessagesState):
+    """Call the LLM. It either responds with a final message OR with tool calls."""
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+def should_continue(state: MessagesState) -> str:
+    """Decide where to go after agent_node."""
+    last = state["messages"][-1]
+    return "tools" if last.tool_calls else END
+
+# Build the graph
+graph = StateGraph(MessagesState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", ToolNode(LANGGRAPH_TOOLS))
+graph.add_edge(START, "agent")
+graph.add_conditional_edges("agent", should_continue)
+graph.add_edge("tools", "agent")
+agent_graph = graph.compile()
 
 
 load_dotenv()
@@ -95,6 +183,62 @@ def verify_api_key(provided_key: str | None = Depends(api_key_header)):
     if provided_key != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     
+def _new_session():
+    return SessionLocal()
+
+@tool
+def list_contacts_tool() -> dict:
+    """List all contacts in the database. Returns a list of contacts with id, name, age, email."""
+    db = _new_session()
+    try:
+        contacts = db.scalars(select(ContactDB)).all()
+        return {"contacts": [{"id": c.id, "name": c.name, "age": c.age, "email": c.email} for c in contacts]}
+    finally:
+        db.close()
+
+@tool
+def add_contact_tool(name: str, age: int, email: str) -> dict:
+    """Add a new contact to the database. Use when the user wants to create or save a new contact."""
+    db = _new_session()
+    try:
+        db_c = ContactDB(name=name, age=age, email=email)
+        db.add(db_c)
+        try:
+            db.commit()
+            db.refresh(db_c)
+            return {"id": db_c.id, "name": db_c.name, "age": db_c.age, "email": db_c.email}
+        except IntegrityError:
+            db.rollback()
+            return {"error": f"Contact named '{name}' already exists"}
+    finally:
+        db.close()
+
+@tool
+def find_contact_tool(name: str) -> dict:
+    """Find a single contact by their exact name. Returns the contact's details or an error if not found."""
+    db = _new_session()
+    try:
+        c = db.scalars(select(ContactDB).where(ContactDB.name == name)).first()
+        if c is None:
+            return {"error": f"No contact named '{name}'"}
+        return {"id": c.id, "name": c.name, "age": c.age, "email": c.email}
+    finally:
+        db.close()
+
+@tool
+def delete_contact_tool(name: str) -> dict:
+    """Delete a contact by name. Use ONLY when the user explicitly asks to delete or remove a contact."""
+    db = _new_session()
+    try:
+        c = db.scalars(select(ContactDB).where(ContactDB.name == name)).first()
+        if c is None:
+            return {"error": f"No contact named '{name}'"}
+        db.delete(c)
+        db.commit()
+        return {"deleted": True, "name": name}
+    finally:
+        db.close()
+
 class ContactCreate(BaseModel):
     text: str
 
@@ -550,3 +694,31 @@ def run_agent(req: AgentRequest, db: Session = Depends(get_db)):
 
     # Hit max_steps without a final answer
     return AgentResponse(answer="(agent stopped after max_steps without finishing)", steps=steps)
+
+@app.post("/agent/graph", response_model=AgentResponse, dependencies=[Depends(verify_api_key)])
+def run_agent_graph(req: AgentRequest):
+    initial_messages = [
+        SystemMessage(content=(
+            "You are a helpful contacts assistant. Use the provided tools to list, add, find, or delete contacts. "
+            "After completing the task, give the user a concise natural-language summary of what you did."
+        )),
+        HumanMessage(content=req.query),
+    ]
+
+    final_state = agent_graph.invoke({"messages": initial_messages})
+
+    # Extract steps from the tool messages
+    steps = []
+    for m in final_state["messages"]:
+        if hasattr(m, "tool_calls") and m.tool_calls:
+            for tc in m.tool_calls:
+                steps.append(AgentStep(tool=tc["name"], args=tc["args"], result={}))
+        if m.__class__.__name__ == "ToolMessage" and steps:
+            try:
+                steps[-1].result = json.loads(m.content) if isinstance(m.content, str) else m.content
+            except Exception:
+                steps[-1].result = {"raw": m.content}
+
+    final_answer = final_state["messages"][-1].content
+    return AgentResponse(answer=final_answer, steps=steps)
+
